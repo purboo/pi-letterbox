@@ -14,6 +14,11 @@ if [ "$host" = "down" ]; then
 	echo "ssh: connect to host down port 22: Connection refused" >&2
 	exit 255
 fi
+if [ "$host" = "slow" ]; then
+	echo "ssh: delayed connection" >&2
+	exec sleep 3
+fi
+if [ "$host" = "missing-marker" ]; then exit 3; fi
 unset PI_LETTERBOX_DIR PI_CODING_AGENT_DIR
 HOME=$FAKE_SSH_HOME
 export HOME

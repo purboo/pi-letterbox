@@ -2,7 +2,7 @@
 
 **A letterbox for a running [pi](https://pi.dev) session, with receipts.**
 
-A script, a cron job, CI, or a pi session on another machine drops a letter. The session reads it at a safe point (now if it is idle, after its current work if it is busy, never in the middle of a compaction), and the sender gets receipts back:
+A script, a cron job, CI, or a pi session on another machine drops a letter. The session reads it at a safe point (now if it is idle, after its current work if it is busy), and the sender gets receipts back. While pi compacts between turns (idle, no run), letters stay in `new/`. During automatic compaction inside a run a letter may be taken and queued; it enters the model after compaction ends:
 
 ```text
 $ pi-letterbox send --host buildbox work --wait done "Nightly is red: see /logs/nightly.log and fix it."
@@ -58,11 +58,11 @@ pi-letterbox send work --wait done --timeout 1800 "Run the release checklist."
 |---|---|
 | `--host <ssh-host>` | The box is on another host. Uses `ssh -o BatchMode=yes`; the far side needs nothing but `/bin/sh`. |
 | `--wait delivered\|read\|done` | Wait for that receipt. Exit 0 when it arrives, 3 on timeout, 4 when the letter is declined or rejected. |
-| `--timeout <s>` | How long to wait (default 600). |
+| `--timeout <s>` | How long to wait (default 600). Remote waits have one local deadline, including SSH connection time; connection failures exit 1 with diagnostics, not timeout 3. |
 | `--steer` | Interrupt a busy session at its next step instead of queueing behind its work. |
 | `--no-ack` | A notice: don't ask the agent for a *done* receipt. |
 | `--ttl <s>` | Reject the letter if no session takes it within this time. |
-| `--id <id>` | Choose the id. Sending the same id again never sends twice, so retries are safe. |
+| `--id <id>` | Choose the id. Concurrent sends with the same id claim it exactly once (locally or over SSH). A crash after the claim but before writing the letter leaves the id used and `status` reports `sending`; resending it returns `exists`, so send a new id to retry that case. |
 | `--from <label>` | Who is writing (default `user@host`). |
 | `--json` | Machine-readable output. |
 
@@ -74,10 +74,14 @@ A letter sent while no session reads the box waits on disk; the sender is told s
 
 | Receipt | Means |
 |---|---|
-| `delivered` | The session took the letter: it started a turn, or queued it behind the current work, or steered it in. |
+| `delivered` | Handed to a session at least once: started a turn, queued, or steered. Not proof that it reached the conversation; a recovered/requeued letter keeps this state. |
 | `read` | The letter is in the conversation the model sees. |
 | `done` / `declined` | The agent called `letterbox_done` with a note: what it did, or why not. |
 | `rejected` | The session could not take it (invalid, too large, expired), with the reason. |
+
+Receipts never move backwards. Final outcomes cannot change; repeating the same outcome is an idempotent success and may only update `note`. `letterbox_done` accepts `id`, optional `box`, `outcome` (`done` by default, or `declined`), and `note`. It only confirms a letter owned by the current session id, including after `pi -c`; once redelivered to a different session, the former session cannot confirm it. Without `box` it searches every box; an id matching more than one box requires `box`.
+
+Delivery is **at least once for letters that never reached a conversation**. The current reader scans `cur/` on open and every 10 seconds. Dead runtimes' queued letters are checked against their saved JSONL conversation, then marked read/archived or requeued. A live runtime's lease protects queued letters even after takeover. Its own missing delivery is retried only after 10 seconds, while idle with no pending messages and no copy in its session file. A taker that died before writing a receipt is recovered after 30 seconds. After three delivery attempts, an unreached letter is rejected with `not delivered after 3 attempts`. A requeued letter may appear twice, so recipients should handle work idempotently.
 
 The agent learns to send receipts from the letter itself, which ends with a one-line instruction (omitted with `--no-ack`). The `letterbox_done` tool is declared to the model only while a box is open. Opening one in the middle of a session adds the tool once; on providers that cannot add tools mid-conversation that costs one cache rebuild.
 
@@ -91,12 +95,18 @@ Plain files, so anything that can write a file can send, and nothing needs to ru
 
 ```text
 ~/.pi/agent/letterbox/<box>/
-  tmp/<id>.json        the sender writes here first …
-  new/<id>.json        … then renames here: a letter is never seen half-written
-  cur/<id>.json        letters the session has taken
-  receipts/<id>.json   the latest receipt, replaced atomically
-  reader.json          the session reading the box, with a heartbeat
+  tmp/<id>.<pid>.<random>.json  unique sender temporary file …
+  new/<id>.json        … then atomically renamed here (never half-written)
+  cur/<id>.json        taken, not yet in a conversation
+  seen/<id>.json       archived read/final or rejected letters (.invalid names preserved)
+  ids/<id>/            permanent atomic send claim, one per id ever sent
+  receipts/<id>.json   latest monotonic receipt, atomically replaced
+  reader.json         exclusive reader: token, pid, host, session_id/file, cwd, since, beat
+  leases/<token>.json  runtime heartbeat, kept even after reader takeover
+  locks/<name>/        short node mkdir locks: reader or r.<id> (receipt)
 ```
+
+The layout is backwards compatible with 0.1.0 boxes: old read/final letters in `cur/` are archived by recovery, without a migration. Each open uses a random 16-byte hex token; ownership changes use the reader lock. Reader and lease beats update every 15 seconds, and liveness requires a beat younger than 90 seconds plus a live pid on this host (foreign hosts use the beat). Shutdown and `/letterbox close` remove runtime leases; recovery removes leases dead for over 24 hours. Delivered receipts include `token`, `attempts`, `session_id` and `session_file`; recovery records `requeued_at` without resetting the state.
 
 A letter is JSON: `{"v":1,"id":"…","text":"…","from":"…","created_at":"…"}`, with optional `"delivery":"steer"`, `"ack":false` and `"expires_at"`. Text is limited to 64 KiB; send a path for anything bigger. Remote sends and waits are one `ssh host sh -s` each, with the script on stdin. `PI_LETTERBOX_DIR` moves the root on either side; `PI_LETTERBOX_SSH` replaces the `ssh` command (for example `ssh -p 2222`).
 

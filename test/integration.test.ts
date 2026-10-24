@@ -97,6 +97,79 @@ async function cli(args: string[], env: Record<string, string>) {
 const receipt = (root: string, box: string, id: string) => lb.readReceipt(root, box, id);
 
 describe("pi-letterbox in a real pi", () => {
+	test("F1 RPC queued letter survives new_session and is handed over exactly once more", async () => {
+		server = await startCaptureServer();
+		let release!: () => void;
+		const hold = new Promise<void>((r) => { release = r; });
+		const ack = acknowledging();
+		let first = true;
+		server.respond((req) => {
+			if (first) { first = false; return { text: "working", hold }; }
+			return ack(req);
+		});
+		const root = newRoot();
+		const p = await pi({ baseUrl: server.url, args: ["--letterbox", "demo"], env: { PI_LETTERBOX_DIR: root } });
+		await until(() => lb.readReader(root, "demo"));
+		await p.prompt("work");
+		await server.waitForRequests(1);
+		const old = lb.readReader(root, "demo")!;
+		lb.dropLetter(root, "demo", lb.makeLetter({ id: "recover", text: "recovered work" }));
+		await until(() => receipt(root, "demo", "recover")?.delivery === "queued");
+		expect(server.requests.length).toBe(1);
+		const switched = await p.send({ type: "new_session" }, 15_000);
+		expect(switched.success).toBe(true);
+		release();
+		await until(() => receipt(root, "demo", "recover")?.state === "done", 30_000, "recovered letter done");
+		const r = receipt(root, "demo", "recover")!;
+		expect(r.attempts).toBe(2);
+		expect(r.session_id).not.toBe(old.session_id);
+		expect(existsSync(join(root, "demo/cur/recover.json"))).toBe(false);
+		expect(existsSync(join(root, "demo/seen/recover.json"))).toBe(true);
+		expect(server.requests.filter((q) => textOf(lastUser(q)?.content).includes("recovered work")).length).toBe(1);
+	}, 60_000);
+
+	test("F3 concurrent RPC opens leave exactly one reader without take", async () => {
+		server = await startCaptureServer();
+		server.respond(acknowledging());
+		const root = newRoot();
+		const options = { baseUrl: server.url, args: ["--letterbox", "demo"], env: { PI_LETTERBOX_DIR: root } };
+		const [a, b] = await Promise.all([pi(options), pi(options)]);
+		const owner = await until(() => lb.readReader(root, "demo"));
+		await until(() => [...a.notifications(), ...b.notifications()].some((s) => s.includes("is read by pid")));
+		lb.dropLetter(root, "demo", lb.makeLetter({ id: "exclusive", text: "one reader" }));
+		await until(() => receipt(root, "demo", "exclusive")?.state === "done");
+		expect(receipt(root, "demo", "exclusive")!.pid).toBe(owner.pid);
+		expect(receipt(root, "demo", "exclusive")!.attempts).toBe(1);
+		expect(readdirSync(join(root, "demo/leases"))).toEqual([`${owner.token}.json`]);
+	}, 60_000);
+
+	test("F4 own receipt remains valid after pi -c", async () => {
+		server = await startCaptureServer();
+		server.respond(() => ({ text: "received" }));
+		const root = newRoot();
+		const agentDir = scratch("agent"), sessionDir = scratch("sessions"), cwd = scratch("cwd");
+		roots.push(agentDir, sessionDir, cwd);
+		const options = { baseUrl: server.url, agentDir, sessionDir, cwd, env: { PI_LETTERBOX_DIR: root } };
+		const a = await pi({ ...options, args: ["--letterbox", "demo"] });
+		await until(() => lb.readReader(root, "demo"));
+		lb.dropLetter(root, "demo", lb.makeLetter({ id: "resume", text: "remember this" }));
+		await until(() => receipt(root, "demo", "resume")?.state === "read");
+		await a.waitForAgentEnd();
+		const id = receipt(root, "demo", "resume")!.session_id;
+		await a.stop();
+		server.respond(acknowledging());
+		const b = await pi({ ...options, args: ["--continue", "--letterbox", "demo"] });
+		await until(() => lb.readReader(root, "demo"));
+		expect(lb.readReader(root, "demo")!.session_id).toBe(id);
+		server.respond((req) => {
+			if (textOf(lastUser(req)?.content).includes("finish receipt")) return { toolCalls: [{ name: "letterbox_done", arguments: { id: "resume", box: "demo", note: "resumed" } }] };
+			return { text: "ok" };
+		});
+		await b.prompt("finish receipt");
+		await until(() => receipt(root, "demo", "resume")?.state === "done");
+		expect(receipt(root, "demo", "resume")!.note).toBe("resumed");
+	}, 60_000);
+
 	test("an idle session takes a letter, starts a turn, and the agent's receipt reaches the waiting sender", async () => {
 		server = await startCaptureServer();
 		server.respond(acknowledging("did X"));
@@ -250,7 +323,7 @@ describe("pi-letterbox in a real pi", () => {
 		const root = newRoot();
 		const env = { PI_LETTERBOX_DIR: root };
 		const a = await pi({ baseUrl: server.url, args: ["--letterbox", "demo"], env });
-		await until(() => lb.readReader(root, "demo"), 10_000, "reader A");
+		const readerA = await until(() => lb.readReader(root, "demo"), 10_000, "reader A");
 		const b = await pi({ baseUrl: server.url, args: ["--letterbox", "demo"], env });
 		await until(() => b.notifications().find((n) => n.includes("is read by pid")), 10_000, "busy notice");
 		expect(lb.readReader(root, "demo")!.pid).toBe(a.child.pid!);
@@ -266,6 +339,10 @@ describe("pi-letterbox in a real pi", () => {
 		expect(receipt(root, "demo", "B1")!.pid).toBe(b.child.pid!);
 		await until(() => a.notifications().find((n) => n.includes("took over")), 10_000, "A notices");
 		expect(lb.readReader(root, "demo")!.pid).toBe(b.child.pid!); // A did not write it back
+		expect(existsSync(join(root, `demo/leases/${readerA.token}.json`))).toBe(true); // takeover is not runtime shutdown
+		await a.stop();
+		expect(existsSync(join(root, `demo/leases/${readerA.token}.json`))).toBe(false);
+		expect(lb.readReader(root, "demo")!.pid).toBe(b.child.pid!);
 	}, 90_000);
 
 	test("an unreadable letter gets a rejected receipt; an expired one too", async () => {

@@ -1,7 +1,7 @@
 // The CLI as users run it (node bin/pi-letterbox.mjs), locally and over a stand-in ssh.
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import * as lb from "../lib/letterbox.mjs";
@@ -39,6 +39,75 @@ async function cli(args: string[], extra: Record<string, string> = {}, stdin?: s
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+
+for (const kind of ["node", "sh"] as const) {
+	test(`F2 barrier concurrent --id send (${kind}) claims exactly once`, async () => {
+		const root = scratch();
+		const letter = lb.makeLetter({ id: "race", text: "hello" });
+		const children = [0, 1].map((i) => {
+			const barrier = `touch ${lb.shq(join(root, `ready${i}`))}; while [ ! -f ${lb.shq(join(root, "go"))} ]; do sleep 0.01; done\n`;
+			if (kind === "sh") return Bun.spawn(["sh", "-s"], { stdin: new Blob([barrier + 'cat() { sleep 0.2; command cat "$@"; }\n' + lb.shDrop(root, "b", letter)]), stdout: "pipe", stderr: "pipe" });
+			const script = `import * as lb from ${JSON.stringify(join(ROOT, "lib/letterbox.mjs"))};
+			import fs from 'node:fs'; import { syncBuiltinESMExports } from 'node:module';
+			fs.writeFileSync(${JSON.stringify(join(root, `ready${i}`))}, '');
+			while (!fs.existsSync(${JSON.stringify(join(root, "go"))})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10);
+			const exists = fs.existsSync; fs.existsSync = (f) => { const v = exists(f); if (String(f).endsWith('/receipts/race.json') && !v) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,200); return v; }; syncBuiltinESMExports();
+			console.log(lb.dropLetter(${JSON.stringify(root)},'b',${JSON.stringify(letter)}));`;
+			return Bun.spawn(["node", "--input-type=module", "-e", script], { stdout: "pipe", stderr: "pipe" });
+		});
+		const until = Date.now() + 5000;
+		while (![0, 1].every((i) => existsSync(join(root, `ready${i}`)))) {
+			if (Date.now() > until) throw new Error("barrier timed out");
+			await sleep(10);
+		}
+		writeFileSync(join(root, "go"), "");
+		const results = await Promise.all(children.map(async (p) => ({ code: await p.exited, out: await new Response(p.stdout).text(), err: await new Response(p.stderr).text() })));
+		expect(results.map((x) => x.code)).toEqual([0, 0]);
+		expect(results.map((x) => x.out.trim()).sort()).toEqual(["exists", "sent"]);
+		expect(readdirSync(join(root, "b/new"))).toEqual(["race.json"]);
+		expect(readdirSync(join(root, "b/tmp"))).toEqual([]);
+	});
+}
+
+test("F6 failed ssh exits 1 with stderr, not a silent timeout", async () => {
+	const home = scratch();
+	const extra = { PI_LETTERBOX_SSH: FAKE_SSH, FAKE_SSH_HOME: home };
+	const failed = await cli(["wait", "--host", "down", "b", "id", "--timeout", "0"], extra);
+	expect(failed.code).toBe(1);
+	expect(failed.err).toContain("Connection refused");
+});
+
+test("F6 slow ssh is killed at the hard deadline without a query marker", async () => {
+	const home = scratch();
+	const extra = { PI_LETTERBOX_SSH: FAKE_SSH, FAKE_SSH_HOME: home };
+	const began = Date.now();
+	const slow = await cli(["wait", "--host", "slow", "b", "id", "--timeout", "1"], extra);
+	expect(Date.now() - began).toBeLessThan(2500);
+	expect(slow.code).toBe(1); // query never ran: no marker
+	expect(slow.err).not.toBe("");
+});
+
+test("F6 missing marker is an error; queried not-reached state exits 3", async () => {
+	const home = scratch();
+	const extra = { PI_LETTERBOX_SSH: FAKE_SSH, FAKE_SSH_HOME: home };
+	const missing = await cli(["wait", "--host", "missing-marker", "b", "id", "--timeout", "1"], extra);
+	expect(missing.code).toBe(1);
+	expect(missing.err).toContain("marker");
+	const timeout = await cli(["wait", "--host", "far", "b", "id", "--timeout", "1"], extra);
+	expect(timeout.code).toBe(3);
+});
+
+test("atomic claim without a letter is sending locally and over sh", async () => {
+	const root = scratch();
+	const p = lb.ensureBox(root, "b");
+	mkdirSync(join(p.dir, "ids/id"), { recursive: true });
+	for (const host of [[], ["--host", "far"]]) {
+		const result = await cli(["status", ...host, "--dir", root, "b", "id", "--json"], { PI_LETTERBOX_SSH: FAKE_SSH, FAKE_SSH_HOME: root });
+		expect(result.code).toBe(0);
+		expect(JSON.parse(result.out).state).toBe("sending");
+	}
+});
 
 describe("local", () => {
 	test("send drops a letter, says nobody reads the box yet, and is idempotent by id", async () => {

@@ -6,6 +6,7 @@
  * A session reads a box only when told to: `pi --letterbox <name>`, `PI_LETTERBOX=<name>`, or `/letterbox open
  * <name>` (remembered by the session, so `pi -c` reopens it). The file protocol lives in lib/letterbox.mjs.
  */
+import { randomBytes } from "node:crypto";
 import { chmodSync, existsSync, type FSWatcher, mkdirSync, readFileSync, watch, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
@@ -20,6 +21,7 @@ const MESSAGE = "letterbox";
 const TOOL = "letterbox_done";
 const STATUS = "letterbox";
 const SCAN_MS = 2000;
+const RECOVER_MS = 10_000;
 const BEAT_MS = 15_000;
 const CLI = fileURLToPath(new URL("../bin/pi-letterbox.mjs", import.meta.url));
 
@@ -30,12 +32,13 @@ interface LetterDetails {
 	ack?: boolean;
 }
 
-type Reader = { v: 1; pid: number; host: string; session_id?: string; session_file?: string; cwd?: string; since: string; beat: string };
+type Reader = { v: 1; token: string; pid: number; host: string; session_id?: string; session_file?: string; cwd?: string; since: string; beat: string };
 
 export default function piLetterbox(pi: ExtensionAPI): void {
 	pi.registerFlag("letterbox", { description: "Read this letterbox in this session (see /letterbox)", type: "string" });
 
 	let ctx: ExtensionContext | undefined;
+	let startedSession: string | undefined;
 	let root = lb.defaultRoot();
 	let box: string | undefined; // the box this session wants to read
 	let me: Reader | undefined; // set while this session is the box's reader
@@ -44,7 +47,9 @@ export default function piLetterbox(pi: ExtensionAPI): void {
 	let beatTimer: ReturnType<typeof setInterval> | undefined;
 	let kick: ReturnType<typeof setTimeout> | undefined;
 	let draining = false;
-	const opened = new Set<string>(); // boxes this runtime has read, for receipts after a switch
+	const leases = new Map<string, { root: string; box: string; reader: Reader }>();
+	const inflight = new Map<string, { box: string; deliveredAt: number }>();
+	let recoveredAt = 0;
 
 	const status = (text: string | undefined) => {
 		if (ctx?.hasUI) ctx.ui.setStatus(STATUS, text);
@@ -64,9 +69,8 @@ export default function piLetterbox(pi: ExtensionAPI): void {
 		watcher?.close();
 		watcher = undefined;
 		if (scanTimer) clearInterval(scanTimer);
-		if (beatTimer) clearInterval(beatTimer);
 		if (kick) clearTimeout(kick);
-		scanTimer = beatTimer = kick = undefined;
+		scanTimer = kick = undefined;
 		if (me && box) {
 			try {
 				lb.releaseReader(root, box, me);
@@ -75,7 +79,7 @@ export default function piLetterbox(pi: ExtensionAPI): void {
 		me = undefined;
 	}
 
-	/** Deliver now only when pi can take a message: idle (starts a turn) or mid-run (queues). Not while compacting. */
+	/** Idle compaction cannot take messages; automatic compaction mid-run may queue them (pi delivers later). */
 	const canDeliver = (c: ExtensionContext) => c.isIdle() || c.signal !== undefined;
 
 	function drain(): void {
@@ -84,6 +88,10 @@ export default function piLetterbox(pi: ExtensionAPI): void {
 		if (!stillMine()) return;
 		draining = true;
 		try {
+			if (Date.now() - recoveredAt >= RECOVER_MS) {
+				lb.recoverLetters(root, box, { token: me.token, inflight, isIdle: () => c.isIdle(), hasPendingMessages: () => c.hasPendingMessages(), session_file: c.sessionManager.getSessionFile() });
+				recoveredAt = Date.now();
+			}
 			for (const name of lb.waiting(root, box)) {
 				if (!canDeliver(c)) break; // try again on the next scan
 				const taken = lb.takeLetter(root, box, name);
@@ -95,22 +103,24 @@ export default function piLetterbox(pi: ExtensionAPI): void {
 				const letter = taken.letter;
 				const idle = c.isIdle();
 				const details: LetterDetails = { id: letter.id, box, from: letter.from, ack: letter.ack !== false };
+				lb.writeReceipt(root, box, letter.id, {
+					state: "delivered",
+					attempts: (lb.readReceipt(root, box, letter.id)?.attempts ?? 0) + 1,
+					from: letter.from,
+					delivery: idle ? "started a turn" : letter.delivery === "steer" ? "steered" : "queued",
+					...whoAmI(),
+				});
+				inflight.set(letter.id, { box, deliveredAt: Date.now() });
 				try {
 					pi.sendMessage(
 						{ customType: MESSAGE, content: lb.formatForModel(letter, box, TOOL), display: true, details },
 						idle ? { triggerTurn: true } : { triggerTurn: true, deliverAs: letter.delivery === "steer" ? "steer" : "followUp" },
 					);
 				} catch (e) {
-					lb.untakeLetter(root, box, letter.id);
+					// Keep cur/ and inflight: recovery also catches async failures swallowed by pi.
 					notify(`pi-letterbox: could not deliver ${letter.id}: ${(e as Error).message}`, "warning");
 					break;
 				}
-				lb.writeReceipt(root, box, letter.id, {
-					state: "delivered",
-					from: letter.from,
-					delivery: idle ? "started a turn" : letter.delivery === "steer" ? "steered" : "queued",
-					...whoAmI(),
-				});
 			}
 		} catch (e) {
 			notify(`pi-letterbox: ${(e as Error).message}`, "warning");
@@ -120,6 +130,7 @@ export default function piLetterbox(pi: ExtensionAPI): void {
 	}
 
 	const whoAmI = () => ({
+		token: me?.token,
 		session_id: me?.session_id,
 		session_file: me?.session_file,
 		host: me?.host ?? hostname(),
@@ -139,11 +150,26 @@ export default function piLetterbox(pi: ExtensionAPI): void {
 	}
 
 	function beat(): void {
-		if (!box || !me || !stillMine()) return;
-		me.beat = new Date().toISOString();
+		const now = new Date().toISOString();
+		for (const lease of leases.values()) {
+			lease.reader.beat = now;
+			try { lb.writeLease(lease.root, lease.box, lease.reader); } catch {}
+		}
+		if (!box || !me) return;
 		try {
-			lb.writeReader(root, box, me);
+			if (!lb.beatReader(root, box, me)) stillMine();
 		} catch {}
+	}
+
+	function endRuntime(): void {
+		stopReading();
+		if (beatTimer) clearInterval(beatTimer);
+		beatTimer = undefined;
+		for (const [token, lease] of leases) {
+			try { lb.releaseLease(lease.root, lease.box, token); } catch {}
+		}
+		leases.clear();
+		inflight.clear();
 	}
 
 	/** Become the reader of `name`. Returns why not, or undefined. */
@@ -153,15 +179,10 @@ export default function piLetterbox(pi: ExtensionAPI): void {
 		stopReading();
 		box = name;
 		const p = lb.ensureBox(root, name);
-		const r = lb.readReader(root, name) as Reader | undefined;
-		if (!take && r && r.pid !== process.pid && lb.readerLive(r)) {
-			status(`✉ ${name} (busy)`);
-			setToolActive(false);
-			return `letterbox "${name}" is read by pid ${r.pid} on ${r.host} (${r.cwd ?? "?"}); use /letterbox open ${name} --take to take it over`;
-		}
 		const now = new Date().toISOString();
-		me = {
+		const reader: Reader = {
 			v: 1,
+			token: randomBytes(16).toString("hex"),
 			pid: process.pid,
 			host: hostname(),
 			session_id: c.sessionManager.getSessionId(),
@@ -170,8 +191,16 @@ export default function piLetterbox(pi: ExtensionAPI): void {
 			since: now,
 			beat: now,
 		};
-		lb.writeReader(root, name, me);
-		opened.add(name);
+		const r = lb.claimReader(root, name, reader, take);
+		if (r) {
+			status(`✉ ${name} (busy)`);
+			setToolActive(false);
+			return `letterbox "${name}" is read by pid ${r.pid} on ${r.host} (${r.cwd ?? "?"}); use /letterbox open ${name} --take to take it over`;
+		}
+		me = reader;
+		lb.writeLease(root, name, me);
+		leases.set(me.token, { root, box: name, reader: me });
+		recoveredAt = 0;
 		process.env.PI_LETTERBOX_BOX = name;
 		try {
 			watcher = watch(p.new, () => {
@@ -191,8 +220,10 @@ export default function piLetterbox(pi: ExtensionAPI): void {
 		}
 		scanTimer = setInterval(drain, SCAN_MS);
 		scanTimer.unref?.();
-		beatTimer = setInterval(beat, BEAT_MS);
-		beatTimer.unref?.();
+		if (!beatTimer) {
+			beatTimer = setInterval(beat, BEAT_MS);
+			beatTimer.unref?.();
+		}
 		status(`✉ ${name}`);
 		setToolActive(true);
 		drain();
@@ -200,7 +231,7 @@ export default function piLetterbox(pi: ExtensionAPI): void {
 	}
 
 	function close(): void {
-		stopReading();
+		endRuntime();
 		box = undefined;
 		delete process.env.PI_LETTERBOX_BOX;
 		status(undefined);
@@ -235,7 +266,11 @@ export default function piLetterbox(pi: ExtensionAPI): void {
 	}
 
 	pi.on("session_start", (_e, c) => {
-		stopReading();
+		// RPC can rebind an already-started runtime twice during new_session. That is not a new open/attempt.
+		const sessionId = c.sessionManager.getSessionId();
+		if (startedSession === sessionId) { ctx = c; return; }
+		endRuntime();
+		startedSession = sessionId;
 		ctx = c;
 		root = lb.defaultRoot();
 		box = undefined;
@@ -251,7 +286,8 @@ export default function piLetterbox(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", () => {
-		stopReading();
+		endRuntime();
+		startedSession = undefined;
 		ctx = undefined;
 	});
 
@@ -263,8 +299,8 @@ export default function piLetterbox(pi: ExtensionAPI): void {
 		const b = m.details?.box;
 		if (!id || !b || !lb.ID_RE.test(id) || !lb.BOX_RE.test(b)) return;
 		try {
-			const r = lb.readReceipt(root, b, id);
-			if (r && lb.RANK[r.state] < lb.RANK.read) lb.writeReceipt(root, b, id, { state: "read" });
+			lb.markRead(root, b, id);
+			inflight.delete(id);
 		} catch {}
 	});
 
@@ -275,21 +311,27 @@ export default function piLetterbox(pi: ExtensionAPI): void {
 			'Send the receipt for a letter that reached this session through pi-letterbox: outcome "done" once you have handled it, or "declined" with a note saying why you will not. The sender may be waiting for this receipt, so send it when the work the letter asks for is finished or refused, not when you start.',
 		parameters: Type.Object({
 			id: Type.String({ description: "The letter id, as given in the letter" }),
+			box: Type.Optional(Type.String({ description: "The letterbox name; required if this id reached this session in more than one box" })),
 			outcome: Type.Optional(Type.Union([Type.Literal("done"), Type.Literal("declined")], { description: "done (default) or declined" })),
 			note: Type.Optional(Type.String({ description: "One or two sentences for the sender: what was done, or why not" })),
 		}),
 		defaultActive: false,
-		async execute(_callId, params) {
+		async execute(_callId, params, _signal, _onUpdate, c) {
 			const id = String(params.id ?? "").trim();
 			if (!lb.ID_RE.test(id)) throw new Error(`"${id}" is not a letter id`);
-			const candidates = [...new Set([box, ...opened].filter((b): b is string => !!b))];
-			const b = candidates.find((x) => lb.readReceipt(root, x, id));
+			if (params.box !== undefined && !lb.BOX_RE.test(params.box)) throw new Error(`invalid box name "${params.box}"`);
+			const sessionId = c.sessionManager.getSessionId();
+			const candidates = params.box !== undefined ? [params.box] : lb.listBoxes(root);
+			const matches = candidates.filter((b) => {
+				const r = lb.readReceipt(root, b, id);
+				return r?.session_id === sessionId && ["delivered", "read", "done", "declined"].includes(r.state);
+			});
+			if (matches.length > 1) throw new Error(`letter ${id} reached this session in more than one box; specify box`);
+			const b = matches[0];
 			if (!b) throw new Error(`no letter ${id} reached this session`);
-			const prev = lb.readReceipt(root, b, id)!;
-			if (prev.state === "rejected") throw new Error(`letter ${id} was rejected (${prev.reason ?? "invalid"}); it has no receipt to send`);
 			const outcome = params.outcome === "declined" ? "declined" : "done";
 			const note = params.note ? lb.cleanLabel(params.note, lb.MAX_NOTE_CHARS) : undefined;
-			const r = lb.writeReceipt(root, b, id, { state: outcome, ...(note ? { note } : {}) });
+			const r = lb.doneReceipt(root, b, id, sessionId, outcome, note);
 			return {
 				content: [{ type: "text", text: `Receipt sent: letter ${id} is ${r.state}.` }],
 				details: { id, box: b, state: r.state },

@@ -99,18 +99,29 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /** Run a /bin/sh script on `host` (script on stdin). Resolves with stdout and the exit code. */
 function ssh(host, script, { timeoutMs } = {}) {
 	const cmd = (process.env.PI_LETTERBOX_SSH || "ssh").split(/\s+/).filter(Boolean);
-	const args = [...cmd.slice(1), "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4", host, "sh -s"];
+	const args = [...cmd.slice(1), "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
+		...(timeoutMs !== undefined ? ["-o", `ConnectTimeout=${Math.max(1, Math.min(30, Math.ceil(timeoutMs / 1000)))}`] : []), host, "sh -s"];
 	return new Promise((resolve) => {
-		const child = spawn(cmd[0], args, { stdio: ["pipe", "pipe", "pipe"] });
+		const child = spawn(cmd[0], args, { stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
 		let out = "";
 		let err = "";
+		let timedOut = false;
 		child.stdout.setEncoding("utf8").on("data", (c) => (out += c));
 		child.stderr.setEncoding("utf8").on("data", (c) => (err += c));
-		const t = timeoutMs ? setTimeout(() => child.kill("SIGTERM"), timeoutMs) : undefined;
-		child.on("error", (e) => resolve({ code: 255, out, err: String(e) }));
+		const t = timeoutMs !== undefined ? setTimeout(() => {
+			timedOut = true;
+			try {
+				if (process.platform !== "win32") process.kill(-child.pid, "SIGKILL");
+				else child.kill("SIGKILL");
+			} catch {}
+		}, timeoutMs) : undefined;
+		child.on("error", (e) => {
+			if (t) clearTimeout(t);
+			resolve({ code: 255, out, err: String(e), timedOut });
+		});
 		child.on("close", (code) => {
 			if (t) clearTimeout(t);
-			resolve({ code: code ?? 255, out, err });
+			resolve({ code: code ?? 255, out, err, timedOut });
 		});
 		child.stdin.on("error", () => {}); // ssh that exits early (unreachable host) closes stdin; its exit code says why
 		child.stdin.end(script);
@@ -156,17 +167,15 @@ async function waitFor(o, box, id, until, timeoutSec) {
 			await sleep(Math.min(500, Math.max(0, deadline - Date.now())));
 		}
 	}
-	let last;
-	for (;;) {
-		const left = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
-		const res = await ssh(o.host, lb.shWait(o.dir, box, id, until, left));
-		const r = parseReceipt(res.out);
-		if (r) last = r;
-		if (res.code === 0 || (res.code === 3 && Date.now() >= deadline - 1000)) return last;
-		if (Date.now() >= deadline) return last;
-		// The connection broke (255) or the far side ended early: try again until the deadline.
-		await sleep(2000);
-	}
+	// Even timeout 0 may perform one immediate query; a 50 ms scheduling allowance stays within the 1 s cap.
+	const remaining = Math.max(50, deadline - Date.now());
+	// Remote date has whole-second precision: keep its loop alive past the local hard deadline.
+	const remoteSeconds = timeoutSec === 0 ? 0 : Math.ceil(remaining / 1000) + 1;
+	const res = await ssh(o.host, lb.shWait(o.dir, box, id, until, remoteSeconds), { timeoutMs: remaining });
+	const marker = res.out.split("\n").includes("pi-letterbox-wait");
+	if (marker && (res.code === 0 || res.code === 3 || res.timedOut)) return parseReceipt(res.out);
+	const detail = res.err.trim().split("\n").slice(-3).join(" ");
+	throw new Error(`ssh ${o.host} failed (exit ${res.code}): ${detail || (marker ? "connection failed" : "missing pi-letterbox-wait marker")}`);
 }
 
 async function send(o) {
@@ -228,13 +237,13 @@ async function status(o) {
 		const root = o.dir ?? lb.defaultRoot();
 		r = lb.readReceipt(root, box, id);
 		const p = lb.boxPaths(root, box);
-		where = existsSync(join(p.new, `${id}.json`)) ? "waiting" : existsSync(join(p.cur, `${id}.json`)) ? "taken" : "unknown";
+		where = existsSync(join(p.new, `${id}.json`)) ? "waiting" : existsSync(join(p.cur, `${id}.json`)) ? "taken" : existsSync(join(p.ids, id)) ? "sending" : "unknown";
 	}
 	if (r) {
 		show(o, r, receiptLine(r));
 		return EXIT.ok;
 	}
-	const state = where === "taken" ? "taken" : where === "waiting" ? "waiting" : "unknown";
+	const state = ["taken", "waiting", "sending"].includes(where) ? where : "unknown";
 	show(o, { id, state }, `${id}: ${state === "waiting" ? "waiting for a session to take it" : state}`);
 	return state === "unknown" ? EXIT.error : EXIT.ok;
 }

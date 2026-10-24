@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import extension from "../src/index.ts";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import * as lb from "../lib/letterbox.mjs";
 
+const runtimes: { close(): void }[] = [];
 const dirs: string[] = [];
 const root = () => {
 	const d = mkdtempSync(join(tmpdir(), "pi-letterbox-unit-"));
@@ -11,6 +13,7 @@ const root = () => {
 	return d;
 };
 afterEach(() => {
+	for (const run of runtimes.splice(0)) run.close();
 	for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
@@ -83,7 +86,7 @@ describe("drop and take", () => {
 		expect(out["bad.json"]).toEqual({ rejected: { id: "bad", reason: "not valid JSON" } });
 		expect(out["odd name.json"]).toMatchObject({ rejected: { id: undefined } });
 		expect((out["old.json"] as { rejected: { reason: string } }).rejected.reason).toContain("expired");
-		expect(existsSync(join(r, "b/cur/odd name.invalid"))).toBe(true);
+		expect(existsSync(join(r, "b/seen/odd name.invalid"))).toBe(true);
 	});
 
 	test("waiting is oldest first", () => {
@@ -135,9 +138,9 @@ describe("reader", () => {
 
 	test("release removes only our own reader file", () => {
 		const r = root();
-		const me = { v: 1 as const, pid: process.pid, host: hostname(), since: "s1", beat: "b" };
+		const me = { v: 1 as const, token: "one", pid: process.pid, host: hostname(), since: "s1", beat: "b" };
 		lb.writeReader(r, "b", me);
-		lb.releaseReader(r, "b", { ...me, since: "s2" });
+		lb.releaseReader(r, "b", { ...me, token: "two", since: "s2" });
 		expect(lb.readReader(r, "b")?.since).toBe("s1");
 		lb.releaseReader(r, "b", me);
 		expect(lb.readReader(r, "b")).toBeUndefined();
@@ -150,6 +153,142 @@ test("formatForModel carries the receipt instruction only when asked", () => {
 		'Letter q1 in letterbox "b" from ci:\n\ndo X\n\n(The sender is waiting for a receipt: when you have handled this letter, call letterbox_done with id "q1"; use outcome "declined" with a note if you will not do it.)',
 	);
 	expect(lb.formatForModel({ ...l, ack: false }, "b")).toBe('Letter q1 in letterbox "b" from ci:\n\ndo X');
+});
+
+
+// A minimal extension runtime: no model/network, with real session lifecycle and disk protocol.
+function runtime(r: string, session = "own") {
+	const handlers = new Map<string, Function>();
+	let tool: any;
+	let active: string[] = [];
+	const c: any = { cwd: r, mode: "rpc", hasUI: false, isIdle: () => true, hasPendingMessages: () => false,
+		sessionManager: { getSessionId: () => session, getSessionFile: () => undefined, getBranch: () => [] } };
+	const pi: any = { registerFlag() {}, getFlag: () => "b", getActiveTools: () => active,
+		setActiveTools: (a: string[]) => { active = a; }, on: (name: string, fn: Function) => handlers.set(name, fn),
+		registerTool: (t: any) => { tool = t; }, registerCommand() {}, registerMessageRenderer() {}, sendMessage() {} };
+	extension(pi);
+	const prev = process.env.PI_LETTERBOX_DIR;
+	process.env.PI_LETTERBOX_DIR = r;
+	handlers.get("session_start")!({}, c);
+	if (prev === undefined) delete process.env.PI_LETTERBOX_DIR; else process.env.PI_LETTERBOX_DIR = prev;
+	const run = { done: (params: any) => tool.execute("call", params, undefined, undefined, c),
+		close: () => handlers.get("session_shutdown")!({}, c) };
+	runtimes.push(run);
+	return run;
+}
+
+test("F1 recovery: dead foreign leases consult JSONL, requeue missing messages and cap attempts", () => {
+	const r = root();
+	const p = lb.ensureBox(r, "b");
+	const file = join(r, "session.jsonl");
+	writeFileSync(file, '{broken\n' + JSON.stringify({ type: "custom_message", customType: "letterbox", details: { id: "seen", box: "b" } }) + '\n');
+	for (const id of ["seen", "lost", "cap", "live", "orphan", "busy", "dropped", "pending", "saved"]) {
+		lb.dropLetter(r, "b", lb.makeLetter({ id, text: id }));
+		lb.takeLetter(r, "b", `${id}.json`);
+		if (id !== "orphan") lb.writeReceipt(r, "b", id, { state: "delivered", token: ["busy", "dropped", "pending", "saved"].includes(id) ? "mine" : id === "live" ? "alive" : "dead", attempts: id === "cap" ? 3 : 1, session_file: file });
+	}
+	utimesSync(join(p.cur, "orphan.json"), new Date(0), new Date(0));
+	// These additions use the public disk layout, not a private implementation hook.
+	const leases = join(p.dir, "leases");
+	mkdirSync(leases, { recursive: true });
+	writeFileSync(join(leases, "alive.json"), JSON.stringify({ pid: process.pid, host: hostname(), beat: new Date().toISOString() }));
+	writeFileSync(join(leases, "old.json"), JSON.stringify({ beat: new Date(0).toISOString() }));
+	const inflight = new Map(["busy", "dropped", "pending", "saved"].map((id) => [id, { box: "b", deliveredAt: Date.now() - 20_000 }]));
+	const recover = (idle: boolean, pending = false) => lb.recoverLetters(r, "b", { token: "mine", inflight, isIdle: () => idle, hasPendingMessages: () => pending, session_file: file });
+	recover(false);
+	expect(lb.readReceipt(r, "b", "seen")?.state).toBe("read");
+	expect(existsSync(join(p.dir, "seen/seen.json"))).toBe(true);
+	expect(lb.waiting(r, "b").sort()).toEqual(["lost.json", "orphan.json"]);
+	expect(lb.readReceipt(r, "b", "lost")?.requeued_at).toBeString();
+	expect(lb.readReceipt(r, "b", "cap")).toMatchObject({ state: "rejected", reason: "not delivered after 3 attempts" });
+	expect(existsSync(join(p.cur, "busy.json"))).toBe(true);
+	expect(existsSync(join(p.cur, "live.json"))).toBe(true);
+	expect(existsSync(join(leases, "old.json"))).toBe(false);
+	recover(true, true);
+	expect(existsSync(join(p.cur, "pending.json"))).toBe(true);
+	writeFileSync(file, JSON.stringify({ type: "message", message: { role: "custom", customType: "letterbox", details: { id: "saved", box: "b" } } }) + '\n');
+	recover(true);
+	expect(lb.waiting(r, "b")).toContain("dropped.json");
+	expect(existsSync(join(p.cur, "saved.json"))).toBe(true);
+});
+
+test("F3 exclusive opens: fresh foreign same-pid reader is busy; stale owners cannot beat/release takeover", () => {
+	const r = root();
+	const a = runtime(r);
+	const first = lb.readReader(r, "b")!;
+	const b = runtime(r, "second"); // concurrent runtimes in one process must still be distinct readers
+	expect(lb.readReader(r, "b")).toEqual(first);
+	b.close();
+	expect(lb.readReader(r, "b")).toEqual(first);
+	a.close();
+	const foreign = { ...first, token: "foreign", host: "another-host", beat: new Date().toISOString() };
+	lb.writeReader(r, "b", foreign);
+	const c = runtime(r);
+	expect(lb.readReader(r, "b")).toEqual(foreign);
+	c.close();
+	const mine = { ...foreign, token: "mine", host: hostname() };
+	lb.writeReader(r, "b", mine);
+	expect(lb.beatReader(r, "b", foreign)).toBe(false);
+	lb.releaseReader(r, "b", foreign);
+	expect(lb.readReader(r, "b")?.token).toBe("mine");
+	expect(lb.readerLive({ ...mine, beat: "bad" })).toBe(false);
+	expect(lb.readerLive({ ...mine, beat: new Date(0).toISOString() })).toBe(false);
+});
+
+test("F4 done requires current session ownership, searches all boxes and requires box for ambiguity", async () => {
+	const r = root();
+	const run = runtime(r);
+	try {
+		lb.writeReceipt(r, "b", "foreign", { state: "delivered", session_id: "other" });
+		await expect(run.done({ id: "foreign" })).rejects.toThrow("no letter foreign reached this session");
+		lb.writeReceipt(r, "other", "own", { state: "read", session_id: "own" });
+		expect((await run.done({ id: "own" })).details.state).toBe("done");
+		lb.writeReceipt(r, "b", "duplicate", { state: "delivered", session_id: "own" });
+		lb.writeReceipt(r, "other", "duplicate", { state: "delivered", session_id: "own" });
+		await expect(run.done({ id: "duplicate" })).rejects.toThrow("box");
+		expect((await run.done({ id: "duplicate", box: "other" })).details.box).toBe("other");
+		await expect(run.done({ id: "duplicate", box: "other", outcome: "declined" })).rejects.toThrow("already done");
+	} finally { run.close(); }
+});
+
+test("F5 final receipts cannot change outcome; repeated outcome updates only note", () => {
+	const r = root();
+	lb.writeReceipt(r, "b", "reject", { state: "rejected", reason: "expired" });
+	expect(() => lb.writeReceipt(r, "b", "reject", { state: "done" })).toThrow("letter reject is already rejected");
+	lb.writeReceipt(r, "b", "done", { state: "done", note: "one", session_id: "own" });
+	expect(() => lb.writeReceipt(r, "b", "done", { state: "declined" })).toThrow("letter done is already done");
+	const next = lb.writeReceipt(r, "b", "done", { state: "done", note: "two", session_id: "other", reason: "stale" });
+	expect(next).toMatchObject({ state: "done", note: "two", session_id: "own" });
+	expect(next.reason).toBeUndefined();
+});
+
+test("mkdir locks release on error and break stale owners", () => {
+	const r = root();
+	const dir = join(lb.ensureBox(r, "b").locks, "reader");
+	expect(() => lb.withLock(r, "b", "reader", () => {
+		const owner = JSON.parse(readFileSync(join(dir, "owner"), "utf8"));
+		expect(owner).toMatchObject({ pid: process.pid, host: hostname() });
+		expect(owner.time).toBeNumber();
+		throw new Error("callback failed");
+	})).toThrow("callback failed");
+	expect(existsSync(dir)).toBe(false);
+	mkdirSync(dir);
+	utimesSync(dir, new Date(0), new Date(0));
+	expect(lb.withLock(r, "b", "reader", () => "acquired")).toBe("acquired");
+	expect(readdirSync(join(r, "b/locks"))).toEqual([]);
+});
+
+test("old read/final cur letters are archived without migration", () => {
+	const r = root();
+	const p = lb.ensureBox(r, "b");
+	for (const state of ["read", "done"] as const) {
+		lb.dropLetter(r, "b", lb.makeLetter({ id: state, text: state }));
+		lb.takeLetter(r, "b", `${state}.json`);
+		lb.writeReceipt(r, "b", state, { state });
+	}
+	lb.recoverLetters(r, "b", { token: "mine", inflight: new Map(), isIdle: () => true, hasPendingMessages: () => false });
+	expect(readdirSync(p.cur)).toEqual([]);
+	expect(readdirSync(p.seen).sort()).toEqual(["done.json", "read.json"]);
 });
 
 test("shq quotes for /bin/sh", () => {
