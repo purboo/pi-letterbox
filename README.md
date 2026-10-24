@@ -103,10 +103,12 @@ Plain files, so anything that can write a file can send, and nothing needs to ru
   receipts/<id>.json   latest monotonic receipt, atomically replaced
   reader.json         exclusive reader: token, pid, host, session_id/file, cwd, since, beat
   leases/<token>.json  runtime heartbeat, kept even after reader takeover
-  locks/<name>/        short node mkdir locks: reader or r.<id> (receipt)
+  locks/<name>/        short node locks (reader, r.<id>): one owner-<nonce> file
 ```
 
 The layout is backwards compatible with 0.1.0 boxes: old read/final letters in `cur/` are archived by recovery, without a migration. Each open uses a random 16-byte hex token; ownership changes use the reader lock. Reader and lease beats update every 15 seconds, and liveness requires a beat younger than 90 seconds plus a live pid on this host (foreign hosts use the beat). Shutdown and `/letterbox close` remove runtime leases; recovery removes leases dead for over 24 hours. Delivered receipts include `token`, `attempts`, `session_id` and `session_file`; recovery records `requeued_at` without resetting the state.
+
+Locks are node-only and synchronous. A process builds `locks/.t-<nonce>/owner-<nonce>` (pid, host, time) and renames that directory onto `locks/<name>`, which succeeds only while the target is absent or empty; release unlinks its own owner file and then removes the directory if it is empty. A lock whose owner pid is dead on this host, or whose owner time is older than 10 seconds, is broken by renaming that exact `owner-<nonce>` file away, so a breaker can never move a newer lock. A holder stalled for more than 10 seconds inside its critical section can therefore lose mutual exclusion (its release then leaves the new holder alone). Waiting gives up after 5 seconds; leftover `.t-*` and `.dead-*` entries older than 60 seconds are swept. Runtimes track in-flight letters per box and id, so the same id in two boxes is recovered independently.
 
 A letter is JSON: `{"v":1,"id":"…","text":"…","from":"…","created_at":"…"}`, with optional `"delivery":"steer"`, `"ack":false` and `"expires_at"`. Text is limited to 64 KiB; send a path for anything bigger. Remote sends and waits are one `ssh host sh -s` each, with the script on stdin. `PI_LETTERBOX_DIR` moves the root on either side; `PI_LETTERBOX_SSH` replaces the `ssh` command (for example `ssh -p 2222`).
 

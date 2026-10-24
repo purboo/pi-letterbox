@@ -193,7 +193,7 @@ test("F1 recovery: dead foreign leases consult JSONL, requeue missing messages a
 	mkdirSync(leases, { recursive: true });
 	writeFileSync(join(leases, "alive.json"), JSON.stringify({ pid: process.pid, host: hostname(), beat: new Date().toISOString() }));
 	writeFileSync(join(leases, "old.json"), JSON.stringify({ beat: new Date(0).toISOString() }));
-	const inflight = new Map(["busy", "dropped", "pending", "saved"].map((id) => [id, { box: "b", deliveredAt: Date.now() - 20_000 }]));
+	const inflight = new Map(["busy", "dropped", "pending", "saved"].map((id) => [`b/${id}`, { box: "b", deliveredAt: Date.now() - 20_000 }]));
 	const recover = (idle: boolean, pending = false) => lb.recoverLetters(r, "b", { token: "mine", inflight, isIdle: () => idle, hasPendingMessages: () => pending, session_file: file });
 	recover(false);
 	expect(lb.readReceipt(r, "b", "seen")?.state).toBe("read");
@@ -262,18 +262,24 @@ test("F5 final receipts cannot change outcome; repeated outcome updates only not
 	expect(next.reason).toBeUndefined();
 });
 
-test("mkdir locks release on error and break stale owners", () => {
+test("locks release on error and break stale owners", () => {
 	const r = root();
 	const dir = join(lb.ensureBox(r, "b").locks, "reader");
 	expect(() => lb.withLock(r, "b", "reader", () => {
-		const owner = JSON.parse(readFileSync(join(dir, "owner"), "utf8"));
+		const files = readdirSync(dir);
+		expect(files).toHaveLength(1);
+		expect(files[0]).toStartWith("owner-");
+		const owner = JSON.parse(readFileSync(join(dir, files[0]!), "utf8"));
 		expect(owner).toMatchObject({ pid: process.pid, host: hostname() });
 		expect(owner.time).toBeNumber();
 		throw new Error("callback failed");
 	})).toThrow("callback failed");
 	expect(existsSync(dir)).toBe(false);
 	mkdirSync(dir);
-	utimesSync(dir, new Date(0), new Date(0));
+	writeFileSync(join(dir, "owner-old"), JSON.stringify({ pid: process.pid, host: hostname(), time: Date.now() - 11_000 }));
+	expect(lb.withLock(r, "b", "reader", () => "acquired")).toBe("acquired");
+	mkdirSync(dir);
+	writeFileSync(join(dir, "owner-dead"), JSON.stringify({ pid: 2 ** 22 + 1, host: hostname(), time: Date.now() }));
 	expect(lb.withLock(r, "b", "reader", () => "acquired")).toBe("acquired");
 	expect(readdirSync(join(r, "b/locks"))).toEqual([]);
 });

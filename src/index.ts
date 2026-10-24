@@ -48,7 +48,7 @@ export default function piLetterbox(pi: ExtensionAPI): void {
 	let kick: ReturnType<typeof setTimeout> | undefined;
 	let draining = false;
 	const leases = new Map<string, { root: string; box: string; reader: Reader }>();
-	const inflight = new Map<string, { box: string; deliveredAt: number }>();
+	const inflight = new Map<string, { box: string; deliveredAt: number }>(); // key: `${box}/${id}`
 	let recoveredAt = 0;
 
 	const status = (text: string | undefined) => {
@@ -110,7 +110,7 @@ export default function piLetterbox(pi: ExtensionAPI): void {
 					delivery: idle ? "started a turn" : letter.delivery === "steer" ? "steered" : "queued",
 					...whoAmI(),
 				});
-				inflight.set(letter.id, { box, deliveredAt: Date.now() });
+				inflight.set(`${box}/${letter.id}`, { box, deliveredAt: Date.now() });
 				try {
 					pi.sendMessage(
 						{ customType: MESSAGE, content: lb.formatForModel(letter, box, TOOL), display: true, details },
@@ -300,7 +300,7 @@ export default function piLetterbox(pi: ExtensionAPI): void {
 		if (!id || !b || !lb.ID_RE.test(id) || !lb.BOX_RE.test(b)) return;
 		try {
 			lb.markRead(root, b, id);
-			inflight.delete(id);
+			inflight.delete(`${b}/${id}`);
 		} catch {}
 	});
 

@@ -12,13 +12,15 @@
 - `pi-letterbox` CLI: `send`, `status`, `wait`, `list`, locally or on another host over ssh (the far side needs
   only `/bin/sh`), with `--wait`, `--timeout`, idempotent `--id`, `--ttl`, `--no-ack` and `--json`.
 - Backwards-compatible layout gains permanent atomic `ids/<id>/` claims, `seen/` archives,
-  `leases/<token>.json` runtime heartbeats and short node `locks/`. Concurrent local and shell sends claim
+  `leases/<token>.json` runtime heartbeats and short node `locks/` (an `owner-<nonce>` file installed by
+  directory rename; stale owners are broken by renaming that exact file, so a breaker never moves a newer
+  lock; a holder stalled over 10 seconds loses exclusion). Concurrent local and shell sends claim
   an id once; a sender crash between claim and rename uses the id without a letter (`status`: `sending`).
 - At-least-once recovery for letters that never reached a conversation: `cur/` holds only unreached
   letters, recovered on open and every 10 seconds using token leases and saved JSONL sessions. Old read/final
   letters in `cur/` are archived automatically. `delivered` means handed to a session at least once and
   stays delivered after requeue (`requeued_at`); duplicates are possible. After three attempts, reject
-  with `not delivered after 3 attempts`.
+  with `not delivered after 3 attempts`. In-flight letters are tracked per box and id.
 - Exclusive token reader claims, beats and release under the reader lock. Runtime leases keep beating
   after takeover and are removed on shutdown/close; dead leases older than 24 hours are cleaned up.
 - `letterbox_done` accepts optional `box`, searches all boxes otherwise (ambiguity requires `box`),
