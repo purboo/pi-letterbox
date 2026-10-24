@@ -1,0 +1,9 @@
+#!/bin/sh
+# Test stand-in for a mkdir(1) that is not exclusive, like uutils coreutils 0.10 (Ubuntu 26.04): it checks,
+# waits, creates, and treats "already a directory" as success, so two racing calls both exit 0.
+# `mkdir -p` is passed through to the real mkdir.
+case " $* " in *" -p "*) exec /bin/mkdir "$@" ;; esac
+for last; do :; done
+if [ -e "$last" ]; then echo "mkdir: $last: File exists" >&2; exit 1; fi
+sleep 0.3
+/bin/mkdir "$last" 2>/dev/null || [ -d "$last" ]

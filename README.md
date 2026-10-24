@@ -99,7 +99,7 @@ Plain files, so anything that can write a file can send, and nothing needs to ru
   new/<id>.json        … then atomically renamed here (never half-written)
   cur/<id>.json        taken, not yet in a conversation
   seen/<id>.json       archived read/final or rejected letters (.invalid names preserved)
-  ids/<id>/            permanent atomic send claim, one per id ever sent
+  ids/<id>             permanent send claim, one per id ever sent, created exclusively
   receipts/<id>.json   latest monotonic receipt, atomically replaced
   reader.json         exclusive reader: token, pid, host, session_id/file, cwd, since, beat
   leases/<token>.json  runtime heartbeat, kept even after reader takeover

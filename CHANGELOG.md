@@ -11,7 +11,8 @@
   reason. The tool is declared only while a box is open.
 - `pi-letterbox` CLI: `send`, `status`, `wait`, `list`, locally or on another host over ssh (the far side needs
   only `/bin/sh`), with `--wait`, `--timeout`, idempotent `--id`, `--ttl`, `--no-ack` and `--json`.
-- Backwards-compatible layout gains permanent atomic `ids/<id>/` claims, `seen/` archives,
+- Backwards-compatible layout gains permanent `ids/<id>` claim files (created with `O_EXCL`, or the shell's
+  noclobber `>`; not `mkdir`, which uutils coreutils 0.10 on Ubuntu 26.04 does not make exclusive), `seen/` archives,
   `leases/<token>.json` runtime heartbeats and short node `locks/` (an `owner-<nonce>` file installed by
   directory rename; stale owners are broken by renaming that exact file, so a breaker never moves a newer
   lock; a holder stalled over 10 seconds loses exclusion). Concurrent local and shell sends claim

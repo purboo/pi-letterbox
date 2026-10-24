@@ -9,6 +9,7 @@ import * as lb from "../lib/letterbox.mjs";
 const ROOT = resolve(import.meta.dir, "..");
 const CLI = join(ROOT, "bin/pi-letterbox.mjs");
 const FAKE_SSH = join(ROOT, "test/fixtures/fake-ssh");
+const RACY_BIN = join(ROOT, "test/fixtures/racy-mkdir");
 
 const dirs: string[] = [];
 const scratch = () => {
@@ -41,13 +42,15 @@ async function cli(args: string[], extra: Record<string, string> = {}, stdin?: s
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 
-for (const kind of ["node", "sh"] as const) {
+for (const kind of ["node", "sh", "sh with a non-exclusive mkdir"] as const) {
 	test(`F2 barrier concurrent --id send (${kind}) claims exactly once`, async () => {
 		const root = scratch();
 		const letter = lb.makeLetter({ id: "race", text: "hello" });
 		const children = [0, 1].map((i) => {
 			const barrier = `touch ${lb.shq(join(root, `ready${i}`))}; while [ ! -f ${lb.shq(join(root, "go"))} ]; do sleep 0.01; done\n`;
-			if (kind === "sh") return Bun.spawn(["sh", "-s"], { stdin: new Blob([barrier + 'cat() { sleep 0.2; command cat "$@"; }\n' + lb.shDrop(root, "b", letter)]), stdout: "pipe", stderr: "pipe" });
+			// The racy mkdir stands in for uutils coreutils 0.10 (Ubuntu 26.04), where two racing mkdirs both succeed.
+			const env = kind === "sh" ? process.env : { ...process.env, PATH: `${RACY_BIN}:${process.env.PATH}` };
+			if (kind !== "node") return Bun.spawn(["sh", "-s"], { env, stdin: new Blob([barrier + 'cat() { sleep 0.2; command cat "$@"; }\n' + lb.shDrop(root, "b", letter)]), stdout: "pipe", stderr: "pipe" });
 			const script = `import * as lb from ${JSON.stringify(join(ROOT, "lib/letterbox.mjs"))};
 			import fs from 'node:fs'; import { syncBuiltinESMExports } from 'node:module';
 			fs.writeFileSync(${JSON.stringify(join(root, `ready${i}`))}, '');
@@ -101,12 +104,15 @@ test("F6 missing marker is an error; queried not-reached state exits 3", async (
 test("atomic claim without a letter is sending locally and over sh", async () => {
 	const root = scratch();
 	const p = lb.ensureBox(root, "b");
-	mkdirSync(join(p.dir, "ids/id"), { recursive: true });
-	for (const host of [[], ["--host", "far"]]) {
-		const result = await cli(["status", ...host, "--dir", root, "b", "id", "--json"], { PI_LETTERBOX_SSH: FAKE_SSH, FAKE_SSH_HOME: root });
-		expect(result.code).toBe(0);
-		expect(JSON.parse(result.out).state).toBe("sending");
-	}
+	writeFileSync(join(p.dir, "ids/id"), "");
+	mkdirSync(join(p.dir, "ids/old"), { recursive: true }); // a directory claim from an earlier build
+	for (const id of ["id", "old"])
+		for (const host of [[], ["--host", "far"]]) {
+			const result = await cli(["status", ...host, "--dir", root, "b", id, "--json"], { PI_LETTERBOX_SSH: FAKE_SSH, FAKE_SSH_HOME: root });
+			expect(result.code).toBe(0);
+			expect(JSON.parse(result.out).state).toBe("sending");
+		}
+	expect(lb.dropLetter(root, "b", lb.makeLetter({ id: "old", text: "again" }))).toBe("exists");
 });
 
 describe("local", () => {
