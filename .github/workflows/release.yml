@@ -1,0 +1,54 @@
+name: release
+# One release per tag: CI must pass, then the exact tagged commit is published to npm with provenance through npm
+# trusted publishing (GitHub OIDC; no npm token is stored anywhere), and a GitHub Release is created from that
+# version's CHANGELOG section. npm trusts only this workflow file in the `npm` environment of purboo/pi-letterbox; the
+# environment admits only `v*` tags.
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+  publish:
+    needs: ci
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write # the OIDC token npm exchanges for a short-lived publish credential
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: "24", registry-url: "https://registry.npmjs.org" }
+      - run: npm install -g npm@latest # trusted publishing needs npm >= 11.5.1
+      - name: Tag matches package version
+        run: test "v$(node -p "require('./package.json').version")" = "${GITHUB_REF_NAME}"
+      - name: Publish on npm (a re-run skips a version that is already published)
+        run: |
+          name="$(node -p "require('./package.json').name")"
+          if npm view "$name@${GITHUB_REF_NAME#v}" version >/dev/null 2>&1; then echo "already published"; exit 0; fi
+          npm publish --provenance --access public --loglevel verbose # verbose: a failed OIDC exchange says why
+          echo "::notice::Published $name@${GITHUB_REF_NAME#v}"
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub Release
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: GitHub Release from the CHANGELOG
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="## $version" '$0 == v { on = 1; next } /^## / && on { exit } on' CHANGELOG.md > notes.md
+          test -s notes.md
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}

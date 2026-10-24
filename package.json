@@ -1,0 +1,64 @@
+{
+  "name": "pi-letterbox",
+  "version": "0.1.0",
+  "description": "A letterbox for a running pi session: scripts, cron, CI or another machine over ssh drop a letter, the session reads it at a safe point, and receipts come back (delivered, read, done).",
+  "type": "module",
+  "license": "MIT",
+  "author": "purboo",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/purboo/pi-letterbox.git"
+  },
+  "homepage": "https://github.com/purboo/pi-letterbox#readme",
+  "bugs": {
+    "url": "https://github.com/purboo/pi-letterbox/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "inbox",
+    "mailbox",
+    "receipt",
+    "ssh",
+    "remote",
+    "automation",
+    "multi-agent"
+  ],
+  "files": [
+    "src",
+    "lib",
+    "bin",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "bin": {
+    "pi-letterbox": "bin/pi-letterbox.mjs"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "engines": {
+    "node": ">=22.19"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "check": "tsc --noEmit && bun test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@earendil-works/pi-tui": "1.4.0",
+    "typebox": "1.3.27",
+    "@types/bun": "1.3.13",
+    "@types/node": "^26.6.4",
+    "typescript": "5.9.3"
+  }
+}

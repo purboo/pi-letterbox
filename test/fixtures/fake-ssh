@@ -1,0 +1,20 @@
+#!/bin/sh
+# Stands in for ssh in tests: skips the options and the host, then runs the remote command here with
+# HOME=$FAKE_SSH_HOME, as a login on another machine would. Host "down" fails like an unreachable one.
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-o) shift 2 ;;
+	-*) shift ;;
+	*) break ;;
+	esac
+done
+host=$1
+shift
+if [ "$host" = "down" ]; then
+	echo "ssh: connect to host down port 22: Connection refused" >&2
+	exit 255
+fi
+unset PI_LETTERBOX_DIR PI_CODING_AGENT_DIR
+HOME=$FAKE_SSH_HOME
+export HOME
+exec sh -c "$*"

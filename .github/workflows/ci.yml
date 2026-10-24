@@ -1,0 +1,33 @@
+name: ci
+# Typecheck and the whole offline suite: unit tests, the CLI against a stand-in ssh, and real pi over RPC with a
+# local capture server standing in for the model.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "24" }
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bunx tsc --noEmit -p .
+      - run: bun test
+      - name: The packed tarball runs
+        run: |
+          npm pack --silent
+          mkdir -p /tmp/pack && tar xzf pi-letterbox-*.tgz -C /tmp/pack
+          node /tmp/pack/package/bin/pi-letterbox.mjs --help | head -1
+          test -f /tmp/pack/package/src/index.ts && test -f /tmp/pack/package/lib/letterbox.mjs
+          ! test -e /tmp/pack/package/test
