@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0
+## 0.1.1
 
 - A session reads a named letterbox (`pi --letterbox <name>`, `PI_LETTERBOX`, or `/letterbox open <name>`,
   remembered across `pi -c`). One reader per box; `--take` takes one over.

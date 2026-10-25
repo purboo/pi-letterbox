@@ -1,6 +1,6 @@
 {
   "name": "pi-letterbox",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A letterbox for a running pi session: scripts, cron, CI or another machine over ssh drop a letter, the session reads it at a safe point, and receipts come back (delivered, read, done).",
   "type": "module",
   "license": "MIT",
